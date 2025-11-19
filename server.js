@@ -1,154 +1,163 @@
-// server.js
-import express from "express";
-import multer from "multer";
-import fs from "fs";
-import path from "path";
-import fetch from "node-fetch";
-import FormData from "form-data";
-import cors from "cors";
+const express = require("express");
+const multer = require("multer");
+const fetch = require("node-fetch");
+require("dotenv").config();
 
 const app = express();
-app.use(cors());
+const upload = multer();
 
-const upload = multer({ dest: "uploads/" });
+app.use(express.json());
 
-app.get("/", (req, res) => res.send("IELTS AI Assessor running"));
+/* --------------------------------------------------
+   CORS MIDDLEWARE (ALLOWS YOUR FRONTEND TO CONNECT)
+-------------------------------------------------- */
+app.use((req, res, next) => {
+  const allowedOrigins = [
+    "https://ielts.allthingsverbal.com",
+    "https://www.ielts.allthingsverbal.com"
+  ];
 
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+/* --------------------------------------------------
+   ROOT CHECK ENDPOINT
+-------------------------------------------------- */
+app.get("/", (req, res) => {
+  res.send("IELTS AI Assessor running");
+});
+
+/* --------------------------------------------------
+   API: UPLOAD AUDIO (MAIN FUNCTION)
+-------------------------------------------------- */
 app.post("/api/upload-audio", upload.single("audio"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: "No audio file uploaded" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No audio file received" });
+    }
 
-    const OPENAI_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY not set");
+    const audioBuffer = req.file.buffer;
 
-    const audioPath = req.file.path;
-    const fileStream = fs.createReadStream(audioPath);
-
-    // Send to OpenAI Whisper (audio transcription)
-    const form = new FormData();
-    form.append("file", fileStream);
-    form.append("model", "whisper-1");
-
-    const whisperResp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    /* ------------------------------
+       1. TRANSCRIBE USING OPENAI
+    ------------------------------ */
+    const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       },
-      body: form
+      body: (() => {
+        const form = new FormData();
+        form.append("file", audioBuffer, "audio.webm");
+        form.append("model", "gpt-4o-transcribe");
+        return form;
+      })(),
     });
 
-    if (!whisperResp.ok) {
-      const text = await whisperResp.text();
-      console.error("Whisper error:", text);
-      throw new Error("Transcription failed");
-    }
-    const whisperJson = await whisperResp.json();
-    const transcript = whisperJson.text || "";
+    const whisperJson = await whisperRes.json();
 
-    // Evaluate using OpenAI chat/completions
-    const prompt = getEvaluationPrompt(transcript);
-    const chatResp = await fetch("https://api.openai.com/v1/chat/completions", {
+    if (!whisperRes.ok) {
+      console.log("Whisper error:", whisperJson);
+      return res.status(500).json({ error: "Transcription failed", details: whisperJson });
+    }
+
+    const transcript = whisperJson.text;
+
+    /* ------------------------------
+       2. GET FEEDBACK USING CHATGPT
+    ------------------------------ */
+    const chatRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: "You are an experienced IELTS examiner. Be concise and numeric when scoring." },
-          { role: "user", content: prompt }
-        ],
-        max_tokens: 400,
-        temperature: 0.2
+          {
+            role: "system",
+            content: "You are an IELTS speaking evaluator. Score fluency, coherence, grammar, and pronunciation."
+          },
+          {
+            role: "user",
+            content: transcript
+          }
+        ]
       })
     });
 
-    if (!chatResp.ok) {
-      const t = await chatResp.text();
-      console.error("Chat error:", t);
-      throw new Error("Evaluation failed");
-    }
-    const chatJson = await chatResp.json();
-    const evalText = chatJson.choices?.[0]?.message?.content || "No feedback returned";
+    const chatJson = await chatRes.json();
 
-    // If ElevenLabs keys are provided, produce TTS
-    const ELEVEN_KEY = process.env.ELEVEN_API_KEY;
-    const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
-    if (!ELEVEN_KEY || !ELEVEN_VOICE_ID) {
-      // cleanup
-      fs.unlinkSync(audioPath);
-      return res.json({ transcript, feedback: evalText, audioUrl: null });
+    if (!chatRes.ok) {
+      console.log("ChatGPT error:", chatJson);
+      return res.status(500).json({ error: "Feedback generation failed", details: chatJson });
     }
 
-    const ttsResp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVEN_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        text: evalText,
-        voice_settings: { stability: 0.4, similarity_boost: 0.2 }
-      })
+    const feedback = chatJson.choices[0].message.content;
+
+    /* ------------------------------
+       3. OPTIONAL: ELEVENLABS FEEDBACK AUDIO
+    ------------------------------ */
+
+    let audioUrl = null;
+
+    if (process.env.ELEVEN_API_KEY && process.env.ELEVEN_VOICE_ID) {
+      const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}`, {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVEN_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text: feedback,
+        })
+      });
+
+      if (ttsRes.ok) {
+        const audioBuffer = await ttsRes.arrayBuffer();
+
+        // Save inside Render's /tmp (ephemeral)
+        const fs = require("fs");
+        const filePath = `/tmp/feedback_${Date.now()}.mp3`;
+        fs.writeFileSync(filePath, Buffer.from(audioBuffer));
+
+        audioUrl = `/public/${filePath.split("/").pop()}`;
+      }
+    }
+
+    res.json({
+      transcript,
+      feedback,
+      audioUrl,
     });
 
-    if (!ttsResp.ok) {
-      const t = await ttsResp.text();
-      console.error("TTS error:", t);
-      fs.unlinkSync(audioPath);
-      return res.json({ transcript, feedback: evalText, audioUrl: null });
-    }
-
-    const audioBuffer = Buffer.from(await ttsResp.arrayBuffer());
-    const outFileName = `public/feedback-${Date.now()}.mp3`;
-    fs.mkdirSync(path.dirname(outFileName), { recursive: true });
-    fs.writeFileSync(outFileName, audioBuffer);
-
-    // remove uploaded audio
-    fs.unlinkSync(audioPath);
-
-    const audioUrl = `/${outFileName}`;
-    return res.json({ transcript, feedback: evalText, audioUrl });
   } catch (err) {
-    console.error("Server error:", err);
-    return res.status(500).json({ error: err.message || "Server error" });
+    console.error(err);
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-function getEvaluationPrompt(transcript) {
-  return `
-Evaluate the following spoken response for IELTS speaking on these five criteria:
-1) Fluency & Coherence
-2) Lexical Resource
-3) Grammatical Range & Accuracy
-4) Pronunciation
-5) Overall band score
+/* --------------------------------------------------
+   STATIC FILE HANDLER FOR PUBLIC AUDIO (optional)
+-------------------------------------------------- */
+app.use("/public", express.static("/tmp"));
 
-Provide:
-- For each criterion, a numeric score on a 1-9 scale and a one-sentence justification.
-- An overall band score (1-9).
-- Two concrete, short improvement tips targeted to the candidate.
-
-Transcript:
-"""${transcript}"""
-Respond in JSON with keys: fluency, lexical, grammar, pronunciation, overall, tips, summary
-
-Example:
-{
- "fluency": {"score":7, "note":"..."},
- "lexical": {"score":6, "note":"..."},
- "grammar": {"score":6, "note":"..."},
- "pronunciation": {"score":6, "note":"..."},
- "overall": 6,
- "tips": ["tip1","tip2"],
- "summary": "short summary here"
-}
-Be concise and return only JSON.
-`;
-}
-
-app.use(express.static("public"));
-
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+/* --------------------------------------------------
+   START SERVER
+-------------------------------------------------- */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
