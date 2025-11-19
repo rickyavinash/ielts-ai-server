@@ -1,0 +1,2 @@
+# Disable all build steps
+echo "No build step required"
