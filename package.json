@@ -1,0 +1,20 @@
+{
+  "name": "ielts-ai-assessor",
+  "version": "1.0.0",
+  "description": "Backend for IELTS speaking AI assessor (uploads audio, transcribes, scores, TTS)",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.4.1",
+    "form-data": "^4.0.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
